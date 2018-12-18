@@ -1,0 +1,93 @@
+ssh_key_path=$1
+cid_server=$2
+command=$3
+
+if [ "$#" -ne 3 ]; then
+	script_name=$(basename "$0")
+	echo "Illegal number of parameters..."
+	echo "USAGE: ${script_name} <SSH_KEY> <CID_SERVER> <COMMAND>"
+	echo "       <COMMAND> = 'start', 'stop', 'status'"
+	exit 1
+fi
+
+current_user=$(whoami)
+
+if [ "${current_user}" != "root" ]; then
+	echo "Please run script under root user ov via sudo..."
+	exit 1
+fi
+
+if [ "${command}" = "start" ] ; then
+	echo "Establish SSH tunnel for ${cid_server} AWS metadata..."
+	ssh_tunnel_start_status=$(ssh -i ${ssh_key_path} -M -o "ExitOnForwardFailure yes" -S aws-metadata-forward -fnNT -L 80:169.254.169.254:80 ec2-user@${cid_server} >/dev/null 2>&1 ; echo $?)
+	if [ "${ssh_tunnel_start_status}" -eq 0 ] ; then
+                echo "...Tunnel established successfully"
+		sleep 2
+        	ssh_tunnel_active=$(nc -dvzw10 localhost 80 >/dev/null 2>&1 ; echo $?)
+		if [ "${ssh_tunnel_active}" -eq 0 ]; then
+			echo "...Remote SSH tunnel end UP"
+		else
+			echo "...Remote SSH tunnel DOWN"
+			echo "Destro SSH tunnel session" 
+			pkill -f "ssh -i ${ssh_key_path} -M"
+			exit 1
+		fi
+        elif [ "${ssh_tunnel_start_status}" -eq 255 ]; then
+		ssh_tunnel_active=$(nc -dvzw10 localhost 80 >/dev/null 2>&1 ; echo $?)
+		if [ "${ssh_tunnel_active}" -eq 0 ]; then
+                        echo "...Remote SSH tunnel end UP"
+                else
+                        echo "...Remote SSH tunnel DOWN"
+                        echo "Destroy SSH tunnel session"
+                        pkill -f "ssh -i ${ssh_key_path} -M"
+                        exit 1
+                fi
+	else
+                echo "...Error happened during tunnel init..."
+        fi
+	echo "Setup pf NST rule -> forward from 169.254.169.254:80 to localhost:80"
+	pf_start_status=$(echo "rdr pass inet proto tcp from any to 168.254.169.254 port 80 -> localhost port 80" | pfctl -f - >/dev/null 2>&1 ; echo $?)
+        if [ "${pf_start_status}" -eq 0 ]; then
+                echo "...NAT rule successfully injected"
+        else
+                echo "...Error happened during NAT rule init..."
+        fi
+
+elif [ "${command}" = "stop" ]; then
+	echo "Destroy SSH tunnel to ${cid_server} AWS metadata..."
+	ssh_tunnel_stop_status=$(ssh -S aws-metadata-forward -O exit ec2-user@${cid_server} >/dev/null 2>&1 ; echo $?)
+	if [ "${ssh_tunnel_stop_status}" -eq 0 ] || [ "${ssh_tunnel_stop_status}" -eq 255 ]; then
+		echo "...Tunnel destroyed successfully"
+	else
+		echo "...Error happened during tunnel shutdown..."
+	fi
+	
+	echo "Reset pf NAT rules..."
+	pf_stop_status=$(pfctl -F all -f /etc/pf.conf >/dev/null 2>&1 ; echo $?)
+	if [ "${pf_stop_status}" -eq 0 ]; then
+		echo "...NAT rules reseted successfully"
+        else
+                echo "...Error happened during NAT rules revert..."
+        fi
+
+elif [ "${command}" = "status" ]; then
+        echo "SSH Tunnel to ${cid_server} AWS metadata..."
+	ssh_tunnel_status=$(ssh -S aws-metadata-forward -O check ec2-user@${cid_server} >/dev/null 2>&1 ; echo $?)
+        if [ "${ssh_tunnel_status}" -eq 0 ]; then
+                echo "...Tunnel UP"
+        else
+                echo "...Tunnel DOWN..."
+        fi
+	echo "pf NAT rule..."
+        pf_status=$(pfctl -s nat 2>&1 | grep "rdr pass on lo0 inet proto tcp from any to 169.254.169.254 port = 80 -> localhost port 80" | wc -l)
+        if [ "${pf_status}" -eq 1 ]; then
+                echo "...NAT rule PRESENT"
+        else
+                echo "...NAT rule ABSENT"
+        fi
+
+else
+	echo "UNKNOWN command. Supported values are 'start', 'stop', 'status'"
+	exit 1
+fi
+
